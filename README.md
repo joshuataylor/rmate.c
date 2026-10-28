@@ -19,7 +19,7 @@ startup, lower memory usage, and zero runtime dependencies.
 # Build
 make
 
-# Install (default: /usr/bin)
+# Install (default: /usr/local/bin; override with PREFIX=/usr)
 sudo make install
 
 # Open a file

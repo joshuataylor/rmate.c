@@ -13,8 +13,9 @@ ifneq ($(BUILD_ID),)
 CFLAGS += -DBUILD_ID=\"+$(BUILD_ID)\"
 endif
 
-PREFIX ?= /usr/bin
-DESTDIR ?= /
+PREFIX ?= /usr/local
+BINDIR ?= $(PREFIX)/bin
+DESTDIR ?=
 
 .SUFFIXES: .o
 .c.o:
@@ -29,7 +30,10 @@ clean:
 	$(RM) $(PROGRAM) $(OBJS)
 
 install: $(PROGRAM)
-	install -d $(DESTDIR)/$(PREFIX)
-	install $(PROGRAM) $(DESTDIR)/$(PREFIX)/$(PROGRAM)
+	install -d $(DESTDIR)$(BINDIR)
+	install -m 755 $(PROGRAM) $(DESTDIR)$(BINDIR)/$(PROGRAM)
 
-.PHONY: clean all
+uninstall:
+	$(RM) $(DESTDIR)$(BINDIR)/$(PROGRAM)
+
+.PHONY: clean all install uninstall
