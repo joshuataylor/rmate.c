@@ -30,7 +30,7 @@ data: 1234\n
 | `data-on-save`   | When `yes`, the server sends file contents back on save                     |
 | `re-activate`    | When `yes`, the editor window is brought to the foreground                  |
 | `token`          | Opaque string echoed back by the server to identify the file (set to the filename, or `"-"` for stdin) |
-| `selection`      | Optional cursor line number                                                 |
+| `selection`      | Optional cursor position: `LINE`, or `LINE:COL` with `-c` / `RMATE_COLUMN=1` |
 | `data`           | Byte count of raw file content that follows immediately after this line     |
 
 After the raw file bytes, `\n.\n` terminates the command. Multiple files are

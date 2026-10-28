@@ -56,8 +56,13 @@ Options:
   -p PORT  Port number to use for connection.
            Defaults to $RMATE_PORT or 52698.
   -w       Wait for file to be closed by TextMate.
-  -l LINE  Place cursor on line number. Repeat for each file,
+  -l LINE[:COL]
+           Place cursor on line number. Repeat for each file,
            e.g. -l 5 -l 10 file1 file2 (5 for file1, 10 for file2).
+           A position in the file argument (file:LINE[:COL], or a
+           preceding +LINE) wins over -l for that file.
+  -c       Send column numbers (selection: LINE:COL). Only for editor
+           servers that accept a column; also enabled by $RMATE_COLUMN=1.
   -m NAME  The display name shown in TextMate.
   -f       Open even if file is not writable.
   -v       Verbose logging messages.
@@ -71,8 +76,23 @@ Options:
 |--------------|--------------------------------------|-------------|
 | `RMATE_HOST` | Editor host to connect to            | `localhost` |
 | `RMATE_PORT` | Editor port to connect to            | `52698`     |
+| `RMATE_COLUMN` | `1` sends `selection: LINE:COL` (same as `-c`) | unset |
 
 Setting `RMATE_HOST=auto` detects the client IP from `SSH_CONNECTION`.
+
+## Cursor positions
+
+Besides `-l`, a position can be given in the file argument, so rmate works as `$EDITOR` for tools that pass Sublime-style `file:LINE[:COL]` or vi-style `+LINE file`:
+
+```sh
+rmate notes.md:12        # line 12
+rmate notes.md:12:4      # line 12, column 4 (column sent only with -c)
+rmate +12 notes.md       # line 12
+```
+
+`file:LINE[:COL]` is only split when the full argument does not exist and the part before the position does, so a real file named `notes.md:12` still opens as itself. Creating a new file whose name ends in `:N` prints a warning, since it usually means a line number was attached to a path that does not exist.
+
+Columns are off by default: RemoteSubl opens files at `<path>:<selection>:0`, so `selection: 12:4` would make it open a new file named `<path>:12`. Use `-c` or `RMATE_COLUMN=1` only with a server that accepts `LINE:COL`.
 
 ## Enhancements over the Original C Version
 

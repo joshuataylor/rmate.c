@@ -55,7 +55,8 @@ int send_open(int sockfd,
               int data_fd,          /* file descriptor, or -1 */
               const char* data_buf, /* in-memory buffer, or NULL */
               size_t data_len,
-              int line);
+              int line,
+              int col);             /* sent as LINE:COL when > 0 */
 ```
 
 It builds the full protocol header in a stack buffer via `snprintf()`, sends

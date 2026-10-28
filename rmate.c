@@ -14,6 +14,7 @@
 
 #define HOST_ENV "RMATE_HOST"
 #define PORT_ENV "RMATE_PORT"
+#define COLUMN_ENV "RMATE_COLUMN"
 #define DEFAULT_HOST "localhost"
 #define DEFAULT_PORT "52698"
 
@@ -189,7 +190,8 @@ send_open(int sockfd,
           int data_fd,
           const char* data_buf,
           size_t data_len,
-          int line)
+          int line,
+          int col)
 {
     char hdr[HOST_NAME_MAX + PATH_MAX * 3 + 256];
 
@@ -208,7 +210,11 @@ send_open(int sockfd,
                        token);
 
     if (line > 0 && off >= 0 && (size_t)off < sizeof(hdr)) {
-        off += snprintf(hdr + off, sizeof(hdr) - off, "selection: %d\n", line);
+        if (col > 0) {
+            off += snprintf(hdr + off, sizeof(hdr) - off, "selection: %d:%d\n", line, col);
+        } else {
+            off += snprintf(hdr + off, sizeof(hdr) - off, "selection: %d\n", line);
+        }
     }
 
     if (off >= 0 && (size_t)off < sizeof(hdr)) {
@@ -246,9 +252,9 @@ send_open(int sockfd,
 }
 
 int
-send_stdin(int sockfd, const char* display_name, const char* data, size_t data_len, int line)
+send_stdin(int sockfd, const char* display_name, const char* data, size_t data_len, int line, int col)
 {
-    return send_open(sockfd, display_name, "-", "-", -1, data, data_len, line);
+    return send_open(sockfd, display_name, "-", "-", -1, data, data_len, line, col);
 }
 
 int
@@ -265,6 +271,13 @@ check_file(const char* filename, int force)
         if (errno != ENOENT) {
             log_msg(ERROR, "Failed to stat file %s: %s", filename, strerror(errno));
             return -1;
+        }
+        const char* colon = strrchr(filename, ':');
+        if (colon && colon[1] != '\0' && strspn(colon + 1, "0123456789") == strlen(colon + 1)) {
+            log_msg(WARNING,
+                    "Creating new file %s; if :%s was meant as a line number, the file before it does not exist",
+                    filename,
+                    colon + 1);
         }
         log_msg(INFO, "Creating new file %s", filename);
         int fd = open(filename, O_CREAT | O_WRONLY | O_CLOEXEC, 0644);
@@ -296,7 +309,7 @@ check_file(const char* filename, int force)
 }
 
 int
-send_file(int sockfd, const char* filename, const char* display_name, int line)
+send_file(int sockfd, const char* filename, const char* display_name, int line, int col)
 {
     int fd = open(filename, O_RDONLY | O_CLOEXEC);
     if (fd == -1) {
@@ -317,7 +330,7 @@ send_file(int sockfd, const char* filename, const char* display_name, int line)
         rpath = filename;
     }
 
-    int ret = send_open(sockfd, display_name, rpath, filename, fd, NULL, (size_t)st.st_size, line);
+    int ret = send_open(sockfd, display_name, rpath, filename, fd, NULL, (size_t)st.st_size, line, col);
     close(fd);
     return ret;
 }
@@ -607,8 +620,13 @@ usage(void)
             "  -p PORT  Port number to use for connection.\n"
             "           Defaults to $%s or %s.\n"
             "  -w       Wait for file to be closed by TextMate.\n"
-            "  -l LINE  Place cursor on line number. Repeat for each file,\n"
+            "  -l LINE[:COL]\n"
+            "           Place cursor on line number. Repeat for each file,\n"
             "           e.g. -l 5 -l 10 file1 file2 (5 for file1, 10 for file2).\n"
+            "           A position in the file argument (file:LINE[:COL], or a\n"
+            "           preceding +LINE) wins over -l for that file.\n"
+            "  -c       Send column numbers (selection: LINE:COL). Only for editor\n"
+            "           servers that accept a column; also enabled by $%s=1.\n"
             "  -m NAME  The display name shown in TextMate.\n"
             "  -f       Open even if file is not writable.\n"
             "  -v       Verbose logging messages.\n"
@@ -617,7 +635,8 @@ usage(void)
             HOST_ENV,
             DEFAULT_HOST,
             PORT_ENV,
-            DEFAULT_PORT);
+            DEFAULT_PORT,
+            COLUMN_ENV);
 }
 
 struct options
@@ -627,11 +646,103 @@ struct options
     char* auto_host;
     int need_wait;
     int force;
+    int send_column;
     int* lines;
+    int* cols;
     int n_lines;
     const char** names;
     int n_names;
+    /* Files after position parsing, with any position taken from the argument. */
+    char** files;
+    char** owned_files;
+    int* file_lines;
+    int* file_cols;
 };
+
+/* Parse "LINE" or "LINE:COL", both positive. Returns 0 on success, -1 otherwise. */
+int
+parse_position(const char* s, int* line, int* col)
+{
+    char* endp;
+    long l, c = 0;
+
+    if (*s < '0' || *s > '9') {
+        return -1;
+    }
+    errno = 0;
+    l = strtol(s, &endp, 10);
+    if (errno || l <= 0 || l > INT_MAX) {
+        return -1;
+    }
+    if (*endp == ':') {
+        const char* cs = endp + 1;
+        if (*cs < '0' || *cs > '9') {
+            return -1;
+        }
+        errno = 0;
+        c = strtol(cs, &endp, 10);
+        if (errno || c <= 0 || c > INT_MAX) {
+            return -1;
+        }
+    }
+    if (*endp != '\0') {
+        return -1;
+    }
+    *line = (int)l;
+    *col = (int)c;
+    return 0;
+}
+
+/*
+ * Editors such as subl take "file:LINE[:COL]", and callers that think rmate is
+ * one (Claude Code picks the argument style from $EDITOR's name) pass it on.
+ * When arg itself does not exist but the part before a trailing ":LINE:COL" or
+ * ":LINE" does, split the position off. Returns 1 with a malloc'd *path on a
+ * split, 0 to use arg as is, -1 on allocation failure.
+ */
+int
+split_file_position(const char* arg, char** path, int* line, int* col)
+{
+    struct stat st;
+
+    if (stat(arg, &st) == 0) {
+        return 0;
+    }
+
+    /* "path:LINE:COL" first, then "path:LINE". */
+    for (int parts = 2; parts >= 1; parts--) {
+        const char* sep = arg + strlen(arg);
+        int ok = 1;
+
+        for (int k = 0; k < parts && ok; k++) {
+            while (sep > arg && sep[-1] != ':') {
+                sep--;
+            }
+            if (sep == arg) {
+                ok = 0;
+            } else {
+                sep--;
+            }
+        }
+        if (!ok || sep == arg || parse_position(sep + 1, line, col) != 0) {
+            continue;
+        }
+
+        char* candidate = strndup(arg, sep - arg);
+        if (!candidate) {
+            return -1;
+        }
+        if (stat(candidate, &st) == 0) {
+            *path = candidate;
+            return 1;
+        }
+        free(candidate);
+    }
+
+    *line = 0;
+    *col = 0;
+    return 0;
+}
 
 /*
  * Returns:
@@ -651,15 +762,24 @@ parse_options(int orig_argc, char* orig_argv[], int* out_argc, char*** out_argv,
         opts->port = DEFAULT_PORT;
     }
 
+    const char* column_env = getenv(COLUMN_ENV);
+    opts->send_column = column_env && *column_env && strcmp(column_env, "0") != 0;
+
     opts->lines = calloc(orig_argc, sizeof(*opts->lines));
+    opts->cols = calloc(orig_argc, sizeof(*opts->cols));
     opts->names = calloc(orig_argc, sizeof(*opts->names));
-    if (!opts->lines || !opts->names) {
+    opts->files = calloc(orig_argc + 1, sizeof(*opts->files));
+    opts->owned_files = calloc(orig_argc + 1, sizeof(*opts->owned_files));
+    opts->file_lines = calloc(orig_argc + 1, sizeof(*opts->file_lines));
+    opts->file_cols = calloc(orig_argc + 1, sizeof(*opts->file_cols));
+    if (!opts->lines || !opts->cols || !opts->names || !opts->files || !opts->owned_files || !opts->file_lines ||
+        !opts->file_cols) {
         log_msg(ERROR, "Failed to allocate memory: %s", strerror(errno));
         return 1;
     }
 
     int ch;
-    while ((ch = getopt(orig_argc, orig_argv, "whvfVH:p:l:m:")) != -1) {
+    while ((ch = getopt(orig_argc, orig_argv, "whvfcVH:p:l:m:")) != -1) {
         switch (ch) {
             case 'w':
                 opts->need_wait = 1;
@@ -671,16 +791,19 @@ parse_options(int orig_argc, char* orig_argv[], int* out_argc, char*** out_argv,
                 opts->port = optarg;
                 break;
             case 'l': {
-                char* endp;
-                errno = 0;
-                long val = strtol(optarg, &endp, 10);
-                if (errno || endp == optarg || *endp != '\0' || val <= 0 || val > INT_MAX) {
+                int line, col;
+                if (parse_position(optarg, &line, &col) != 0) {
                     log_msg(ERROR, "Invalid line number: %s", optarg);
                     return 1;
                 }
-                opts->lines[opts->n_lines++] = (int)val;
+                opts->lines[opts->n_lines] = line;
+                opts->cols[opts->n_lines] = col;
+                opts->n_lines++;
                 break;
             }
+            case 'c':
+                opts->send_column = 1;
+                break;
             case 'm':
                 opts->names[opts->n_names++] = optarg;
                 break;
@@ -700,8 +823,46 @@ parse_options(int orig_argc, char* orig_argv[], int* out_argc, char*** out_argv,
         }
     }
 
-    *out_argc = orig_argc - optind;
-    *out_argv = orig_argv + optind;
+    /*
+     * Resolve per-file positions: a vi-style "+LINE" applies to the next file,
+     * and "file:LINE[:COL]" is split when only the stripped path exists.
+     */
+    int n_files = 0, pending_line = 0, pending_col = 0;
+    for (int i = optind; i < orig_argc; i++) {
+        const char* arg = orig_argv[i];
+        struct stat st;
+        int line, col;
+
+        if (arg[0] == '+' && i + 1 < orig_argc && stat(arg, &st) == -1 && parse_position(arg + 1, &line, &col) == 0) {
+            pending_line = line;
+            pending_col = col;
+            continue;
+        }
+
+        opts->files[n_files] = orig_argv[i];
+        opts->file_lines[n_files] = pending_line;
+        opts->file_cols[n_files] = pending_col;
+        pending_line = pending_col = 0;
+
+        if (strcmp(arg, "-") != 0) {
+            char* path;
+            int r = split_file_position(arg, &path, &line, &col);
+            if (r == -1) {
+                log_msg(ERROR, "Failed to allocate memory: %s", strerror(errno));
+                return 1;
+            }
+            if (r == 1) {
+                log_msg(INFO, "Treating %s as %s at line %d", arg, path, line);
+                opts->files[n_files] = opts->owned_files[n_files] = path;
+                opts->file_lines[n_files] = line;
+                opts->file_cols[n_files] = col;
+            }
+        }
+        n_files++;
+    }
+
+    *out_argc = n_files;
+    *out_argv = opts->files;
 
     if (*out_argc < 1) {
         usage();
@@ -725,8 +886,18 @@ parse_options(int orig_argc, char* orig_argv[], int* out_argc, char*** out_argv,
 void
 free_options(struct options* opts)
 {
+    if (opts->owned_files) {
+        for (int i = 0; opts->files && opts->files[i]; i++) {
+            free(opts->owned_files[i]);
+        }
+    }
     free(opts->lines);
+    free(opts->cols);
     free(opts->names);
+    free(opts->files);
+    free(opts->owned_files);
+    free(opts->file_lines);
+    free(opts->file_cols);
     free(opts->auto_host);
 }
 
@@ -744,16 +915,26 @@ send_files(int sockfd,
     for (int i = 0; i < argc; i++) {
         const char* per_name = (i < opts->n_names) ? opts->names[i] : NULL;
         int per_line = (i < opts->n_lines) ? opts->lines[i] : 0;
+        int per_col = (i < opts->n_lines) ? opts->cols[i] : 0;
         const char* dname;
+
+        if (opts->file_lines[i] > 0) {
+            per_line = opts->file_lines[i];
+            per_col = opts->file_cols[i];
+        }
+        /* Stock servers (e.g. RemoteSubl) misread "selection: LINE:COL", so columns are opt-in. */
+        if (!opts->send_column) {
+            per_col = 0;
+        }
 
         if (!strcmp(argv[i], "-")) {
             dname = make_display_name(per_name, hostname, "untitled (stdin)", dname_buf, sizeof(dname_buf));
-            if (send_stdin(sockfd, dname, stdin_data, stdin_len, per_line) == -1) {
+            if (send_stdin(sockfd, dname, stdin_data, stdin_len, per_line, per_col) == -1) {
                 return -1;
             }
         } else {
             dname = make_display_name(per_name, hostname, argv[i], dname_buf, sizeof(dname_buf));
-            if (send_file(sockfd, argv[i], dname, per_line) == -1) {
+            if (send_file(sockfd, argv[i], dname, per_line, per_col) == -1) {
                 return -1;
             }
         }
