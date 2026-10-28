@@ -16,7 +16,7 @@ protocol helpers, then option parsing and high-level orchestration, then
 
 ```c
 struct cmd {
-    enum CMD_STATE state;   /* CMD_HEADER, CMD_CMD, or CMD_VAR */
+    enum CMD_STATE state;   /* CMD_CMD or CMD_VAR */
     char* filename;         /* token from the server (heap-allocated) */
     size_t file_len;        /* byte count from the "data:" field */
 };
@@ -28,15 +28,16 @@ instance is reused across all commands on one connection.
 ### `enum CMD_STATE`
 
 ```
-CMD_HEADER --(greeting)--> CMD_CMD --(command)--> CMD_VAR
-                              ^                      |
-                              |                      |
-                              +--(empty line)--------+
+CMD_CMD --(command)--> CMD_VAR
+   ^                      |
+   |                      |
+   +--(empty line)--------+
 ```
 
-- **CMD_HEADER**: Initial state. Consumes the server's greeting line
-  (e.g. `mate-server 1.0`), then transitions to CMD_CMD.
-- **CMD_CMD**: Waits for a command keyword (`save` or `close`).
+The server's greeting line is consumed by `read_greeting()` before any files
+are sent, so the receive loop starts in CMD_CMD.
+
+- **CMD_CMD**: Initial state. Waits for a command keyword (`save` or `close`).
 - **CMD_VAR**: Parses `key: value` pairs. When `data:` is encountered, it
   triggers `receive_save()` to consume the file bytes. An empty line resets
   back to CMD_CMD.
@@ -110,7 +111,6 @@ newline). Returns 0 if no complete line is available yet.
 
 A dispatch function driven by `cmd_state->state`:
 
-- **CMD_HEADER**: Read one line (server greeting), transition to CMD_CMD.
 - **CMD_CMD**: Read a command name. Reset state, then transition to CMD_VAR.
 - **CMD_VAR**: Parse `key: value`. On `token:`, save the filename. On
   `data:`, call `receive_save()`. On empty line or parse error, transition
@@ -241,12 +241,25 @@ Uses `getaddrinfo()` to resolve the host/port (supporting both IPv4 and
 IPv6), then tries each address in order. On success, enables `SO_KEEPALIVE`
 to detect dead connections.
 
+### read\_greeting()
+
+Waits up to 10 seconds (`poll()`) for the server's greeting line and reads it
+one byte at a time, so nothing after it is consumed. EOF, `ECONNRESET` or a
+timeout means no editor answered: over ssh, `connect()` to a `RemoteForward`
+port succeeds even when nothing listens on the client side. Doing this before
+sending files and forking makes that a foreground error with exit status 1,
+plus a hint when `SSH_CONNECTION` is set.
+
 ### Background Mode (default)
 
 After sending all files, `main()` forks. The parent exits immediately
 (returning the shell prompt), and the child calls `setsid()` to detach from
 the controlling terminal before entering the receive loop. This prevents
-`SIGHUP` or `SIGINT` from killing the background process.
+`SIGHUP` or `SIGINT` from killing the background process. The child also
+points stdin, and stdout unless a `-` argument writes there, at `/dev/null`,
+so `out=$(rmate file)` or a pipe does not wait for the file to be closed. It
+keeps stderr for save errors and prefixes its messages with `rmate: `, since
+they appear after the shell prompt.
 
 ### Wait Mode (`-w`)
 

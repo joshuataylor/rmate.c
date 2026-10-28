@@ -2,6 +2,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <netdb.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -23,12 +24,15 @@
 #endif
 
 #define PROTO_BUF_SIZE (PATH_MAX + 256)
+#define GREETING_MAX 256
+#define GREETING_TIMEOUT_MS 10000
 
 int verbose = 0;
+/* Set in the forked child, which logs after the shell has redrawn its prompt. */
+int background = 0;
 
 enum CMD_STATE
 {
-    CMD_HEADER,
     CMD_CMD,
     CMD_VAR
 };
@@ -64,6 +68,9 @@ log_msg(enum log_type type, const char* fmt, ...)
         return;
     }
 
+    if (background) {
+        fputs("rmate: ", stderr);
+    }
     if (isatty(STDERR_FILENO)) {
         fprintf(stderr, "%s%s\033[0m ", log_styles[type].color, log_styles[type].label);
     } else {
@@ -412,13 +419,6 @@ handle_line(int sockfd, char* buf, size_t len, struct cmd* cmd_state, int* save_
     char *name, *value, *sep;
 
     switch (cmd_state->state) {
-        case CMD_HEADER:
-            if ((read_len = read_line(buf, len)) > 0) {
-                log_msg(INFO, "Server header: %s", buf);
-                cmd_state->state = CMD_CMD;
-            }
-            break;
-
         case CMD_CMD:
             if ((read_len = read_line(buf, len)) > 0 && *buf != '\0') {
                 free(cmd_state->filename);
@@ -578,6 +578,72 @@ connect_mate(const char* host, const char* port)
     }
 
     return sockfd;
+}
+
+/*
+ * The server speaks first with a one-line greeting. Over ssh, connect() to a
+ * RemoteForward port succeeds even when nothing answers on the client side, and
+ * sshd then closes the socket, so the greeting is the first sign of a live
+ * editor. Read it byte by byte so nothing after it is consumed.
+ */
+int
+read_greeting(int sockfd, const char* host, const char* port)
+{
+    char buf[GREETING_MAX];
+    size_t len = 0;
+    const char* problem = NULL;
+
+    while (!problem) {
+        struct pollfd pfd = { .fd = sockfd, .events = POLLIN };
+        int pr = poll(&pfd, 1, GREETING_TIMEOUT_MS);
+        if (pr == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
+            log_msg(ERROR, "Failed to wait for the editor on %s:%s: %s", host, port, strerror(errno));
+            return -1;
+        }
+        if (pr == 0) {
+            problem = "timed out waiting for its greeting";
+            break;
+        }
+
+        ssize_t n = read(sockfd, buf + len, 1);
+        if (n == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno != ECONNRESET) {
+                log_msg(ERROR, "Failed to read from the editor on %s:%s: %s", host, port, strerror(errno));
+                return -1;
+            }
+            n = 0;
+        }
+        if (n == 0) {
+            problem = "connection closed before its greeting";
+            break;
+        }
+        if (buf[len] == '\n') {
+            buf[len] = '\0';
+            if (len > 0 && buf[len - 1] == '\r') {
+                buf[len - 1] = '\0';
+            }
+            log_msg(INFO, "Server header: %s", buf);
+            return 0;
+        }
+        if (++len == sizeof(buf)) {
+            problem = "greeting too long";
+        }
+    }
+
+    log_msg(ERROR, "No editor answered on %s:%s (%s)", host, port, problem);
+    const char* ssh = getenv("SSH_CONNECTION");
+    if (ssh && *ssh) {
+        log_msg(WARNING,
+                "Over ssh this port is usually a RemoteForward: start the editor (e.g. RemoteSubl in Sublime Text) "
+                "on the ssh client, or check that another ssh session to this host does not already own the port");
+    }
+    return -1;
 }
 
 const char*
@@ -947,7 +1013,8 @@ receive_loop(int sockfd, int* save_errors)
 {
     char buf[PROTO_BUF_SIZE];
     size_t buf_used = 0;
-    struct cmd cmd_state = { 0 };
+    /* The greeting was already consumed by read_greeting. */
+    struct cmd cmd_state = { .state = CMD_CMD };
     int ret = 0;
 
     while (1) {
@@ -1068,6 +1135,11 @@ main(int argc, char* argv[])
         goto cleanup;
     }
 
+    if (read_greeting(sockfd, opts.host, opts.port) == -1) {
+        ret = 1;
+        goto cleanup;
+    }
+
     if (send_files(sockfd, argc, argv, hostname, stdin_data, stdin_len, &opts) == -1) {
         ret = 1;
         goto cleanup;
@@ -1088,6 +1160,27 @@ main(int argc, char* argv[])
         }
         /* Detach from the controlling terminal so SIGHUP/SIGINT won't reach us. */
         setsid();
+        background = 1;
+
+        /*
+         * Release the caller's stdin, and stdout unless a "-" edit is written
+         * there, so out=$(rmate f) or a pipe doesn't wait for the file to close.
+         * stderr stays so a failed save is still reported.
+         */
+        int devnull = open("/dev/null", O_RDWR | O_CLOEXEC);
+        if (devnull != -1) {
+            int uses_stdout = 0;
+            for (int i = 0; i < argc; i++) {
+                if (!strcmp(argv[i], "-")) {
+                    uses_stdout = 1;
+                }
+            }
+            dup2(devnull, STDIN_FILENO);
+            if (!uses_stdout) {
+                dup2(devnull, STDOUT_FILENO);
+            }
+            close(devnull);
+        }
     }
 
     ret = receive_loop(sockfd, &save_errors);

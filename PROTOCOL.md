@@ -43,22 +43,25 @@ from the server.
 
 ### Server Greeting
 
-The first line the server sends is a greeting/identification line (e.g.
-`220 rmate-server`). The client reads and discards it before processing
-commands.
+The server speaks first: on accept it sends a greeting/identification line
+(e.g. `220 rmate-server`). The client reads it right after connecting, before
+sending any `open` command, and gives up after 10 seconds. Over ssh the port is
+usually a `RemoteForward`, so `connect()` succeeds even when no editor answers
+on the client side and sshd then closes the socket. Waiting for the greeting
+turns that into an immediate error instead of a reset after the client has
+gone to the background.
 
 ### State Machine
 
-The client parses server responses using a three-state machine:
+After the greeting, the client parses server responses using a two-state machine:
 
 ```
-CMD_HEADER --(greeting line)--> CMD_CMD --(command name)--> CMD_VAR
-                                  ^                            |
-                                  |                            |
-                                  +--(empty line / error)------+
+CMD_CMD --(command name)--> CMD_VAR
+   ^                            |
+   |                            |
+   +--(empty line / error)------+
 ```
 
-- **CMD_HEADER**: Consumes the server greeting line, transitions to CMD_CMD.
 - **CMD_CMD**: Waits for a command name (`save` or `close`), transitions to CMD_VAR.
 - **CMD_VAR**: Parses `key: value` pairs. An empty line or parse error transitions back to CMD_CMD.
 
