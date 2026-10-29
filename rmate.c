@@ -26,6 +26,7 @@
 #define PROTO_BUF_SIZE (PATH_MAX + 256)
 #define GREETING_MAX 256
 #define GREETING_TIMEOUT_MS 10000
+#define CONNECT_TIMEOUT_MS 5000
 
 int verbose = 0;
 /* Set in the forked child, which logs after the shell has redrawn its prompt. */
@@ -279,20 +280,7 @@ check_file(const char* filename, int force)
             log_msg(ERROR, "Failed to stat file %s: %s", filename, strerror(errno));
             return -1;
         }
-        const char* colon = strrchr(filename, ':');
-        if (colon && colon[1] != '\0' && strspn(colon + 1, "0123456789") == strlen(colon + 1)) {
-            log_msg(WARNING,
-                    "Creating new file %s; if :%s was meant as a line number, the file before it does not exist",
-                    filename,
-                    colon + 1);
-        }
-        log_msg(INFO, "Creating new file %s", filename);
-        int fd = open(filename, O_CREAT | O_WRONLY | O_CLOEXEC, 0644);
-        if (fd == -1) {
-            log_msg(ERROR, "Failed to create file %s: %s", filename, strerror(errno));
-            return -1;
-        }
-        close(fd);
+        /* Created by create_missing_file() once an editor has answered. */
         return 0;
     }
 
@@ -312,6 +300,36 @@ check_file(const char* filename, int force)
         log_msg(WARNING, "File %s is not writable, opening anyway", filename);
     }
 
+    return 0;
+}
+
+/*
+ * Runs after the greeting, so a missing editor or a typo'd name doesn't leave
+ * an empty file behind.
+ */
+int
+create_missing_file(const char* filename)
+{
+    struct stat st;
+
+    if (stat(filename, &st) == 0 || errno != ENOENT) {
+        return 0;
+    }
+
+    const char* colon = strrchr(filename, ':');
+    if (colon && colon[1] != '\0' && strspn(colon + 1, "0123456789") == strlen(colon + 1)) {
+        log_msg(WARNING,
+                "Creating new file %s; if :%s was meant as a line number, the file before it does not exist",
+                filename,
+                colon + 1);
+    }
+    log_msg(INFO, "Creating new file %s", filename);
+    int fd = open(filename, O_CREAT | O_WRONLY | O_CLOEXEC, 0644);
+    if (fd == -1) {
+        log_msg(ERROR, "Failed to create file %s: %s", filename, strerror(errno));
+        return -1;
+    }
+    close(fd);
     return 0;
 }
 
@@ -537,9 +555,61 @@ parse_ssh_host(void)
 }
 
 int
+in_ssh_session(void)
+{
+    const char* ssh = getenv("SSH_CONNECTION");
+    return ssh && *ssh;
+}
+
+/*
+ * connect() with a timeout, so a host that drops packets fails instead of
+ * blocking for the kernel's SYN retry period. Returns 0, or -1 with errno set.
+ */
+int
+connect_timeout(int fd, const struct sockaddr* addr, socklen_t addrlen, int timeout_ms)
+{
+    int flags = fcntl(fd, F_GETFL);
+    if (flags == -1 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+        return -1;
+    }
+
+    if (connect(fd, addr, addrlen) == -1) {
+        if (errno != EINPROGRESS) {
+            return -1;
+        }
+
+        struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+        int pr;
+        do {
+            pr = poll(&pfd, 1, timeout_ms);
+        } while (pr == -1 && errno == EINTR);
+        if (pr == -1) {
+            return -1;
+        }
+        if (pr == 0) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+
+        int err = 0;
+        socklen_t err_len = sizeof(err);
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &err_len) == -1) {
+            return -1;
+        }
+        if (err) {
+            errno = err;
+            return -1;
+        }
+    }
+
+    return fcntl(fd, F_SETFL, flags);
+}
+
+int
 connect_mate(const char* host, const char* port)
 {
     int sockfd = -1;
+    int last_errno = 0;
     struct addrinfo hints, *servinfo;
 
     memset(&hints, 0, sizeof(hints));
@@ -553,12 +623,18 @@ connect_mate(const char* host, const char* port)
     }
 
     for (struct addrinfo* p = servinfo; p != NULL; p = p->ai_next) {
+        char addr[NI_MAXHOST] = "?";
+        getnameinfo(p->ai_addr, p->ai_addrlen, addr, sizeof(addr), NULL, 0, NI_NUMERICHOST);
+
         if ((sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1) {
+            last_errno = errno;
             continue;
         }
         fcntl(sockfd, F_SETFD, FD_CLOEXEC);
 
-        if (connect(sockfd, p->ai_addr, p->ai_addrlen) == -1) {
+        if (connect_timeout(sockfd, p->ai_addr, p->ai_addrlen, CONNECT_TIMEOUT_MS) == -1) {
+            last_errno = errno;
+            log_msg(INFO, "Failed to connect to %s port %s: %s", addr, port, strerror(errno));
             close(sockfd);
             sockfd = -1;
             continue;
@@ -575,6 +651,16 @@ connect_mate(const char* host, const char* port)
             log_msg(WARNING, "Failed to set SO_KEEPALIVE: %s", strerror(errno));
         }
         log_msg(INFO, "Connected to %s:%s", host, port);
+    } else {
+        log_msg(ERROR, "Could not connect to %s:%s: %s", host, port, strerror(last_errno));
+        if (last_errno == ECONNREFUSED && in_ssh_session()) {
+            log_msg(WARNING,
+                    "Over ssh, nothing listens on port %s here: for an editor on the ssh client, this ssh session "
+                    "needs a RemoteForward (e.g. RemoteForward %s localhost:%s in the client's ssh config)",
+                    port,
+                    port,
+                    port);
+        }
     }
 
     return sockfd;
@@ -637,8 +723,7 @@ read_greeting(int sockfd, const char* host, const char* port)
     }
 
     log_msg(ERROR, "No editor answered on %s:%s (%s)", host, port, problem);
-    const char* ssh = getenv("SSH_CONNECTION");
-    if (ssh && *ssh) {
+    if (in_ssh_session()) {
         log_msg(WARNING,
                 "Over ssh this port is usually a RemoteForward: start the editor (e.g. RemoteSubl in Sublime Text) "
                 "on the ssh client, or check that another ssh session to this host does not already own the port");
@@ -1130,7 +1215,6 @@ main(int argc, char* argv[])
     }
 
     if ((sockfd = connect_mate(opts.host, opts.port)) == -1) {
-        log_msg(ERROR, "Could not connect to %s:%s", opts.host, opts.port);
         ret = 1;
         goto cleanup;
     }
@@ -1138,6 +1222,13 @@ main(int argc, char* argv[])
     if (read_greeting(sockfd, opts.host, opts.port) == -1) {
         ret = 1;
         goto cleanup;
+    }
+
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "-") != 0 && create_missing_file(argv[i]) == -1) {
+            ret = 1;
+            goto cleanup;
+        }
     }
 
     if (send_files(sockfd, argc, argv, hostname, stdin_data, stdin_len, &opts) == -1) {

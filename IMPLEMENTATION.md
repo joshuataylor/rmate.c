@@ -230,16 +230,26 @@ unread data with a short timeout, then closes the socket.
 
 Validates a filename before opening: rejects names containing `\n` or `\r`
 (to prevent protocol injection), checks that the path is a regular file,
-and verifies write permission (unless `-f` is set). Creates the file if it
-does not exist.
+and verifies write permission (unless `-f` is set). A missing file passes
+the check but is not created yet.
+
+### create\_missing\_file()
+
+Creates a file that `check_file()` found missing. `main()` calls it only after
+the editor's greeting, so a missing editor or a typo'd name doesn't leave an
+empty file behind.
 
 ## Connection Lifecycle
 
 ### connect\_mate()
 
 Uses `getaddrinfo()` to resolve the host/port (supporting both IPv4 and
-IPv6), then tries each address in order. On success, enables `SO_KEEPALIVE`
-to detect dead connections.
+IPv6), then tries each address in order. Each attempt goes through
+`connect_timeout()`, a non-blocking `connect()` with a 5 second `poll()`, so a
+host that drops packets fails instead of blocking for the kernel's SYN retry
+period. On success, enables `SO_KEEPALIVE` to detect dead connections. On
+failure it reports the last address's error, plus a `RemoteForward` hint for
+`ECONNREFUSED` when `SSH_CONNECTION` is set.
 
 ### read\_greeting()
 
