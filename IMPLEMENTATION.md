@@ -17,6 +17,7 @@ protocol helpers, then option parsing and high-level orchestration, then
 ```c
 struct cmd {
     enum CMD_STATE state;   /* CMD_CMD or CMD_VAR */
+    enum CMD_TYPE type;     /* CMD_SAVE, CMD_CLOSE or CMD_UNKNOWN */
     char* filename;         /* token from the server (heap-allocated) */
     size_t file_len;        /* byte count from the "data:" field */
 };
@@ -24,6 +25,21 @@ struct cmd {
 
 This is the state machine context for parsing server responses. A single
 instance is reused across all commands on one connection.
+
+### `struct session`
+
+```c
+struct session {
+    int sockfd;
+    char** tokens;          /* the file arguments, as sent in "token:" */
+    int n_tokens;
+    struct cmd cmd;
+    int save_errors;
+};
+```
+
+One editor connection. The receive side only ever writes to a path listed in
+`tokens`, so the editor cannot name files of its own.
 
 ### `enum CMD_STATE`
 
@@ -37,10 +53,13 @@ CMD_CMD --(command)--> CMD_VAR
 The server's greeting line is consumed by `read_greeting()` before any files
 are sent, so the receive loop starts in CMD_CMD.
 
-- **CMD_CMD**: Initial state. Waits for a command keyword (`save` or `close`).
-- **CMD_VAR**: Parses `key: value` pairs. When `data:` is encountered, it
-  triggers `receive_save()` to consume the file bytes. An empty line resets
-  back to CMD_CMD.
+- **CMD_CMD**: Initial state. Waits for a command keyword (`save` or `close`;
+  anything else is logged and its fields ignored).
+- **CMD_VAR**: Parses `key: value` pairs. When `data:` is encountered on a
+  `save` with a known token, it triggers `receive_save()` to consume the file
+  bytes; otherwise `discard_data()` skips them. An empty line resets back to
+  CMD_CMD. An incomplete line (no `\n` yet) leaves the state untouched and
+  waits for more bytes.
 
 ## Protocol: Client → Server
 
@@ -66,8 +85,11 @@ it with `write_all()`, then sends the file content using one of two paths:
 1. **`data_buf != NULL`** (stdin mode): The data is already in memory; write
    it directly.
 2. **`data_fd >= 0`** (file mode): Stream from file descriptor to socket via
-   `stream_data()`, reading and writing in `BUFSIZ` chunks. The file is never
+   `stream_data()`, reading and writing in 64 KiB chunks. The file is never
    loaded into memory.
+
+Every header value (display name, real path, token) is checked for `\n` and
+`\r` first, since a line break would inject a header.
 
 Finally, `"\n.\n"` terminates the command.
 
@@ -109,50 +131,67 @@ newline). Returns 0 if no complete line is available yet.
 
 ### handle\_line()
 
-A dispatch function driven by `cmd_state->state`:
+A dispatch function driven by `s->cmd.state`:
 
-- **CMD_CMD**: Read a command name. Reset state, then transition to CMD_VAR.
+- **CMD_CMD**: Read a command name, record its type, reset the rest of the
+  state, then transition to CMD_VAR.
 - **CMD_VAR**: Parse `key: value`. On `token:`, save the filename. On
-  `data:`, call `receive_save()`. On empty line or parse error, transition
-  back to CMD_CMD.
+  `data:`, parse the length with `parse_data_len()` (digits only, must fit in
+  `size_t`; anything else is a protocol error that ends the connection, since
+  the payload could not be skipped). Then call `receive_save()` if the command
+  is a `save` whose token `known_token()` finds in the session, or
+  `discard_data()` otherwise. On an empty line or a line without a colon,
+  transition back to CMD_CMD. On an incomplete line, return 0 and keep the
+  state.
+
+Strings that came from the editor are passed through `printable()` before they
+appear in a message, so a token cannot put escape sequences on the terminal.
 
 ### receive\_save()
 
-Writes incoming file data to disk:
+Receives a save payload and writes it to disk:
 
 ```c
-ssize_t receive_save(int sockfd,
-                     char* buf_remaining,
+ssize_t receive_save(struct session* s,
+                     const char* buf_remaining,
                      size_t buf_remaining_len,
                      const char* filename,
-                     size_t file_size,
-                     int* save_errors);
+                     size_t file_size);
 ```
 
 When `handle_line()` encounters `data: N`, some of the N file bytes may
 already be in the protocol buffer (read in the same TCP segment as the
-`data:` header). `receive_save()` handles this in two steps:
+`data:` header). `receive_save()` handles this in three steps:
 
-1. Write `buf_remaining` (the bytes already in the buffer) to the file.
+1. `open_spool()` creates an unlinked temporary file next to the target (so a
+   full disk shows up there), falling back to `$TMPDIR`. Write
+   `buf_remaining` (the bytes already in the buffer) to it.
 2. Call `stream_data()` to read the remaining bytes directly from the socket
-   and write them to the file.
+   into the spool.
+3. `commit_save()` opens the target with `O_TRUNC` and copies the spool over
+   it. The target keeps its inode, mode and links, and a symlink is written
+   through, as before. If the token is `"-"`, the copy goes to stdout instead,
+   enabling `echo "text" | rmate -w - > edited.txt`.
 
-If the token is `"-"`, it writes to stdout instead of a file, enabling
-`echo "text" | rmate -w - > edited.txt`.
+The target is only touched in step 3, so a connection that drops or an editor
+that sends fewer bytes than announced leaves the original file intact. The
+remaining failure window is a local write error during the copy.
 
-**Drain mode**: If writing to disk fails (e.g., disk full), `stream_data()`
+**Drain mode**: If writing the spool fails (e.g., disk full), `stream_data()`
 switches to drain-only mode — it continues reading from the socket but
 discards the data. This keeps the protocol stream in sync so subsequent
-commands on the same connection still parse correctly.
+commands on the same connection still parse correctly. `discard_data()` uses
+the same path for payloads that are not going to be saved at all.
 
 **Save error tracking**: A single rmate connection handles saves for all open
 files. If `receive_save()` returned a fatal error on one file's save failure,
 the receive loop would exit and subsequent saves for other files would never
-be processed. To avoid this, save failures (open error, write error, or
-`stream_data()` write failure) increment the caller's `*save_errors` counter
-instead of returning -1. The data is drained to keep the protocol in sync,
-and the loop continues. After the loop exits, the counter is checked and
-the process exit code is set to 1 if any saves failed.
+be processed. To avoid this, save failures (spool, open, write or close
+errors, a save without a token, or a token this run did not open) increment
+`s->save_errors` instead of returning -1. The data is drained to keep the
+protocol in sync, and the loop continues. After the loop exits, the counter is
+checked and the process exit code is set to 1 if any saves failed. A socket
+error or EOF inside the payload is fatal and returns -1.
 
 ## I/O Helpers
 
@@ -163,7 +202,9 @@ short writes. Returns 0 on success, -1 on error.
 
 ### stream\_data()
 
-Transfers `len` bytes from `from_fd` to `to_fd` in `BUFSIZ` chunks:
+Transfers `len` bytes from `from_fd` to `to_fd` in 64 KiB chunks
+(`STREAM_BUF_SIZE`; `BUFSIZ` is only 1 KiB on macOS, which cost a syscall per
+KiB in both directions):
 
 ```c
 int stream_data(int from_fd, int to_fd, size_t len, int drain_on_write_fail);
@@ -205,9 +246,14 @@ need it.
 
 ### parse\_options()
 
-Handles `getopt()`, validates `-l` line numbers with `strtol()`, resolves
-`-H auto` via `parse_ssh_host()`, and adjusts `argc`/`argv` past the options.
-Returns 0 on success, 1 on error, or -1 for early exit (`-V`/`-h`).
+Handles `getopt()`, validates `-l` positions with `parse_position()` (a column
+of 0 means no column, as `subl file:LINE:0` has it), rejects `-m` names with a
+line break, resolves `-H auto` via `parse_ssh_host()`, and adjusts
+`argc`/`argv` past the options. An argument that starts with `-` and names no
+existing file is an error rather than a new file, because BSD `getopt` stops
+at the first file name and `rmate f -w` would otherwise create `-w`. Returns 0
+on success, 1 on error (usage or message printed, exit 1), or -1 for early
+exit (`-V`/`-h`, exit 0).
 
 ### send\_files()
 
@@ -217,9 +263,10 @@ focused on orchestration.
 
 ### receive\_loop()
 
-Owns the protocol buffer and `struct cmd` state machine. Reads from the
-server socket, dispatches via `handle_cmds()`, and tracks `save_errors`.
-Returns 0 on clean shutdown or 1 on error.
+Owns the protocol buffer and drives the `struct session` state machine. Reads
+from the server socket and dispatches via `handle_cmds()`. Returns 0 on clean
+shutdown or 1 on error, including EOF with a partial command still buffered
+and any counted save failures.
 
 ### close\_connection()
 
@@ -230,8 +277,10 @@ unread data with a short timeout, then closes the socket.
 
 Validates a filename before opening: rejects names containing `\n` or `\r`
 (to prevent protocol injection), checks that the path is a regular file,
-and verifies write permission (unless `-f` is set). A missing file passes
-the check but is not created yet.
+that it is readable, and that it is writable (unless `-f` is set). All files
+are checked before the editor is contacted, so a bad later argument cannot
+leave earlier ones open in a dead tab. A missing file passes the check but
+is not created yet.
 
 ### create\_missing\_file()
 
@@ -253,8 +302,9 @@ failure it reports the last address's error, plus a `RemoteForward` hint for
 
 ### read\_greeting()
 
-Waits up to 10 seconds (`poll()`) for the server's greeting line and reads it
-one byte at a time, so nothing after it is consumed. EOF, `ECONNRESET` or a
+Waits up to 10 seconds in total (a `CLOCK_MONOTONIC` deadline across the
+`poll()` calls, as `connect_timeout()` also uses) for the server's greeting
+line and reads it one byte at a time, so nothing after it is consumed. EOF, `ECONNRESET` or a
 timeout means no editor answered: over ssh, `connect()` to a `RemoteForward`
 port succeeds even when nothing listens on the client side. Doing this before
 sending files and forking makes that a foreground error with exit status 1,
@@ -268,8 +318,11 @@ the controlling terminal before entering the receive loop. This prevents
 `SIGHUP` or `SIGINT` from killing the background process. The child also
 points stdin, and stdout unless a `-` argument writes there, at `/dev/null`,
 so `out=$(rmate file)` or a pipe does not wait for the file to be closed. It
-keeps stderr for save errors and prefixes its messages with `rmate: `, since
-they appear after the shell prompt.
+keeps stderr for save errors when that is a terminal or a file, prefixing its
+messages with `rmate: ` since they appear after the shell prompt. A stderr
+that is a pipe or socket is released too, because its reader (sshd running
+`rmate` without a pty, or `2>&1` inside `$(...)`) would otherwise wait for the
+editor to close the file.
 
 ### Wait Mode (`-w`)
 
@@ -329,5 +382,7 @@ allocations, socket) on every exit path.
 distinguish success, error, and early exit (help/version).
 
 Save failures during the receive loop are non-fatal: `receive_save()`
-increments a `save_errors` counter and drains the data to keep the protocol
-in sync. The exit code is set to 1 after the loop if any saves failed.
+increments `session.save_errors` and drains the data to keep the protocol
+in sync. The exit code is set to 1 after the loop if any saves failed. A
+malformed `data:` length, a socket error or EOF inside a payload or a command
+is fatal, since the stream cannot be resynchronised.

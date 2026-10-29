@@ -90,7 +90,7 @@ rmate notes.md:12:4      # line 12, column 4 (column sent only with -c)
 rmate +12 notes.md       # line 12
 ```
 
-`file:LINE[:COL]` is only split when the full argument does not exist and the part before the position does, so a real file named `notes.md:12` still opens as itself. Creating a new file whose name ends in `:N` prints a warning, since it usually means a line number was attached to a path that does not exist.
+`file:LINE[:COL]` is only split when the full argument does not exist and the part before the position does, so a real file named `notes.md:12` still opens as itself. A column of `0` (`notes.md:12:0`, as `subl` writes it) means no column. Creating a new file whose name ends in `:N` prints a warning, since it usually means a line number was attached to a path that does not exist.
 
 Columns are off by default: RemoteSubl opens files at `<path>:<selection>:0`, so `selection: 12:4` would make it open a new file named `<path>:12`. Use `-c` or `RMATE_COLUMN=1` only with a server that accepts `LINE:COL`.
 
@@ -133,11 +133,18 @@ panic, it's not just trivial AI generated code :-).
   shift unconsumed bytes to the front of the buffer, correctly handling TCP
   fragmentation where a single `read()` may return partial lines. The original
   assumed each `read()` returned aligned protocol messages.
-- **Save-path error resilience**: `receive_save` uses a drain mode — if
-  writing to disk fails, it continues reading from the socket to keep the
-  protocol stream in sync rather than leaving the connection in an
-  indeterminate state. Save failures are counted and reflected in the exit
-  code without aborting saves for other files.
+- **Safe saves**: A save is spooled to a temporary file and copied over the
+  target only once the whole payload has arrived, so a dropped connection
+  cannot leave a truncated file. The target keeps its inode and permissions,
+  and symlinks are written through. If writing fails, `receive_save` drains
+  the rest of the payload to keep the protocol stream in sync. Save failures
+  are counted and reflected in the exit code without aborting saves for other
+  files.
+- **The editor is not trusted with paths**: only files named on the command
+  line can be written back, and only by a `save` command with a well-formed
+  length. Anything else is skipped and reported.
+- **Resilient parsing**: a header line cut by a TCP segment or read boundary
+  waits for the rest instead of being misread, so a save is never dropped.
 - **Clean socket shutdown**: Uses `shutdown(SHUT_WR)` followed by a timed
   drain before `close()`, preventing RST packets on macOS/BSD.
 - **Proper background detach**: Uses `fork()` + `setsid()` to fully detach
@@ -145,8 +152,8 @@ panic, it's not just trivial AI generated code :-).
   the background save handler.
 - **SIGPIPE handling**: Ignores `SIGPIPE` so a broken editor connection
   produces a clean error message instead of a silent crash.
-- **Filename validation**: Rejects filenames containing `\n` or `\r` to
-  prevent protocol injection.
+- **Header validation**: Rejects filenames, display names (`-m`) and resolved
+  paths containing `\n` or `\r` to prevent protocol injection.
 - **File descriptor hygiene**: All file descriptors are opened with
   `O_CLOEXEC` (or equivalent) to prevent leaks across `fork()`.
 - **Memory safety**: All allocations are checked, all paths go through

@@ -5,12 +5,14 @@
 #include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #define HOST_ENV "RMATE_HOST"
@@ -24,13 +26,21 @@
 #endif
 
 #define PROTO_BUF_SIZE (PATH_MAX + 256)
+/* Chunk size for copying between a file and the socket. BUFSIZ is only 1 KiB on macOS. */
+#define STREAM_BUF_SIZE 65536
 #define GREETING_MAX 256
 #define GREETING_TIMEOUT_MS 10000
 #define CONNECT_TIMEOUT_MS 5000
 
-int verbose = 0;
+#if defined(__GNUC__)
+#define PRINTF_LIKE(fmt_idx, arg_idx) __attribute__((format(printf, fmt_idx, arg_idx)))
+#else
+#define PRINTF_LIKE(fmt_idx, arg_idx)
+#endif
+
+static int verbose = 0;
 /* Set in the forked child, which logs after the shell has redrawn its prompt. */
-int background = 0;
+static int background = 0;
 
 enum CMD_STATE
 {
@@ -38,11 +48,29 @@ enum CMD_STATE
     CMD_VAR
 };
 
+enum CMD_TYPE
+{
+    CMD_UNKNOWN,
+    CMD_SAVE,
+    CMD_CLOSE
+};
+
 struct cmd
 {
     enum CMD_STATE state;
+    enum CMD_TYPE type;
     char* filename;
     size_t file_len;
+};
+
+/* One editor connection: the socket, the tokens this run sent, and the parser state. */
+struct session
+{
+    int sockfd;
+    char** tokens;
+    int n_tokens;
+    struct cmd cmd;
+    int save_errors;
 };
 
 enum log_type
@@ -62,7 +90,8 @@ static const struct
     [ERROR] = { "Error:", "\033[31m" },
 };
 
-void
+PRINTF_LIKE(2, 3)
+static void
 log_msg(enum log_type type, const char* fmt, ...)
 {
     if (type == INFO && !verbose) {
@@ -85,7 +114,21 @@ log_msg(enum log_type type, const char* fmt, ...)
     fputc('\n', stderr);
 }
 
-char*
+/* Text from the editor ends up in messages on the terminal, so hide control bytes. */
+static const char*
+printable(const char* s, char* buf, size_t buf_len)
+{
+    size_t i;
+
+    for (i = 0; i + 1 < buf_len && s[i] != '\0'; i++) {
+        unsigned char c = (unsigned char)s[i];
+        buf[i] = (c < 0x20 || c == 0x7f) ? '?' : (char)c;
+    }
+    buf[i] = '\0';
+    return buf;
+}
+
+static char*
 read_stdin(size_t* out_len)
 {
     size_t cap = 4096, len = 0;
@@ -133,7 +176,7 @@ read_stdin(size_t* out_len)
     return buf;
 }
 
-int
+static int
 write_all(int fd, const char* buf, size_t len)
 {
     while (len > 0) {
@@ -155,10 +198,10 @@ write_all(int fd, const char* buf, size_t len)
  * If drain_on_write_fail is set, a write failure stops writing but keeps
  * reading until all len bytes are consumed, so the source stream stays in sync.
  */
-int
+static int
 stream_data(int from_fd, int to_fd, size_t len, int drain_on_write_fail)
 {
-    char tmp[BUFSIZ];
+    char tmp[STREAM_BUF_SIZE];
     int write_failed = 0;
 
     while (len > 0) {
@@ -190,7 +233,18 @@ stream_data(int from_fd, int to_fd, size_t len, int drain_on_write_fail)
     return write_failed;
 }
 
-int
+/* Header values are newline-delimited on the wire, so none may contain a line break. */
+static int
+header_value_ok(const char* what, const char* value)
+{
+    if (strchr(value, '\n') || strchr(value, '\r')) {
+        log_msg(ERROR, "%s contains a newline or carriage return, refusing to open", what);
+        return 0;
+    }
+    return 1;
+}
+
+static int
 send_open(int sockfd,
           const char* display_name,
           const char* real_path,
@@ -204,6 +258,11 @@ send_open(int sockfd,
     char hdr[HOST_NAME_MAX + PATH_MAX * 3 + 256];
 
     log_msg(INFO, "Opening %s (%zu bytes)", display_name, data_len);
+
+    if (!header_value_ok("Display name", display_name) || !header_value_ok("Real path", real_path) ||
+        !header_value_ok("Token", token)) {
+        return -1;
+    }
 
     int off = snprintf(hdr,
                        sizeof(hdr),
@@ -259,13 +318,13 @@ send_open(int sockfd,
     return 0;
 }
 
-int
+static int
 send_stdin(int sockfd, const char* display_name, const char* data, size_t data_len, int line, int col)
 {
     return send_open(sockfd, display_name, "-", "-", -1, data, data_len, line, col);
 }
 
-int
+static int
 check_file(const char* filename, int force)
 {
     struct stat st;
@@ -292,6 +351,11 @@ check_file(const char* filename, int force)
         log_msg(ERROR, "%s is not a regular file", filename);
         return -1;
     }
+    /* Checked here so a later file cannot fail after earlier ones are already open in the editor. */
+    if (access(filename, R_OK) == -1) {
+        log_msg(ERROR, "File %s is not readable: %s", filename, strerror(errno));
+        return -1;
+    }
     if (access(filename, W_OK) == -1) {
         if (!force) {
             log_msg(ERROR, "File %s is not writable! Use -f to open anyway", filename);
@@ -307,7 +371,7 @@ check_file(const char* filename, int force)
  * Runs after the greeting, so a missing editor or a typo'd name doesn't leave
  * an empty file behind.
  */
-int
+static int
 create_missing_file(const char* filename)
 {
     struct stat st;
@@ -333,7 +397,7 @@ create_missing_file(const char* filename)
     return 0;
 }
 
-int
+static int
 send_file(int sockfd, const char* filename, const char* display_name, int line, int col)
 {
     int fd = open(filename, O_RDONLY | O_CLOEXEC);
@@ -360,58 +424,190 @@ send_file(int sockfd, const char* filename, const char* display_name, int line, 
     return ret;
 }
 
-ssize_t
-receive_save(int sockfd,
-             char* buf_remaining,
-             size_t buf_remaining_len,
-             const char* filename,
-             size_t file_size,
-             int* save_errors)
+/* Open an unlinked temporary file in dir for a save payload. Returns the fd, or -1 with errno set. */
+static int
+spool_in(const char* dir)
+{
+    char path[PATH_MAX];
+
+    int n = snprintf(path, sizeof(path), "%s/.rmate.XXXXXX", dir);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    int fd = mkstemp(path);
+    if (fd == -1) {
+        return -1;
+    }
+    unlink(path);
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+    return fd;
+}
+
+/*
+ * A save payload is spooled next to its target, so a full disk fails before
+ * the target is touched, falling back to $TMPDIR. stdout saves spool in $TMPDIR.
+ */
+static int
+open_spool(const char* target)
+{
+    int fd = -1;
+
+    if (strcmp(target, "-") != 0) {
+        const char* slash = strrchr(target, '/');
+        if (!slash) {
+            fd = spool_in(".");
+        } else {
+            char dir[PATH_MAX];
+            size_t n = (size_t)(slash - target);
+            if (n == 0) {
+                n = 1; /* a file in the root directory */
+            }
+            if (n < sizeof(dir)) {
+                memcpy(dir, target, n);
+                dir[n] = '\0';
+                fd = spool_in(dir);
+            }
+        }
+    }
+    if (fd == -1) {
+        const char* tmpdir = getenv("TMPDIR");
+        fd = spool_in(tmpdir && *tmpdir ? tmpdir : "/tmp");
+    }
+    return fd;
+}
+
+/* Copy a complete payload from the spool over the target. Returns 0, or 1 after logging. */
+static int
+commit_save(int spool, const char* filename, size_t file_size)
 {
     int fd;
-    int write_failed = 0;
 
     if (!strcmp(filename, "-")) {
         log_msg(INFO, "Writing %zu bytes to stdout", file_size);
         fd = fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, 0);
     } else {
         log_msg(INFO, "Saving %s (%zu bytes)", filename, file_size);
-        fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOCTTY, 0644);
     }
-
     if (fd == -1) {
         log_msg(ERROR, "Failed to open %s for writing: %s", filename, strerror(errno));
-        write_failed = 1;
+        return 1;
     }
 
-    /* buf_remaining holds file data already in the protocol read buffer. */
-    size_t to_read = (buf_remaining_len < file_size) ? buf_remaining_len : file_size;
-
-    if (fd >= 0 && to_read > 0 && write_all(fd, buf_remaining, to_read) == -1) {
-        log_msg(ERROR, "Failed to write to %s: %s", filename, strerror(errno));
-        close(fd);
-        fd = -1;
-        write_failed = 1;
+    int failed = 0;
+    if (lseek(spool, 0, SEEK_SET) == -1 || stream_data(spool, fd, file_size, 0) == -1) {
+        log_msg(ERROR, "Failed to write %s", filename);
+        failed = 1;
     }
-
-    ssize_t ret = (ssize_t)to_read;
-    int drain_ret = stream_data(sockfd, fd, file_size - to_read, 1);
-    if (drain_ret < 0) {
-        ret = -1;
-    } else if (drain_ret > 0) {
-        write_failed = 1;
+    if (close(fd) == -1 && !failed) {
+        log_msg(ERROR, "Failed to close %s: %s", filename, strerror(errno));
+        failed = 1;
     }
-
-    if (fd >= 0) {
-        close(fd);
-    }
-    if (write_failed && ret >= 0) {
-        (*save_errors)++;
-    }
-    return ret;
+    return failed;
 }
 
-ssize_t
+/*
+ * Receive a save payload of file_size bytes, the first buf_remaining_len of
+ * which are already in the protocol buffer. The target is written only once
+ * the whole payload has arrived, so a dropped connection cannot leave a
+ * truncated file behind. A failed save is counted and the rest of the payload
+ * drained to keep the stream in sync. Returns the number of buffered bytes
+ * consumed, or -1 on a socket error.
+ */
+static ssize_t
+receive_save(struct session* s,
+             const char* buf_remaining,
+             size_t buf_remaining_len,
+             const char* filename,
+             size_t file_size)
+{
+    size_t buffered = (buf_remaining_len < file_size) ? buf_remaining_len : file_size;
+    int failed = 0;
+
+    log_msg(INFO, "Receiving %zu bytes for %s", file_size, filename);
+
+    int spool = open_spool(filename);
+    if (spool == -1) {
+        log_msg(ERROR, "Failed to create a temporary file for %s: %s", filename, strerror(errno));
+        failed = 1;
+    } else if (buffered > 0 && write_all(spool, buf_remaining, buffered) == -1) {
+        log_msg(ERROR, "Failed to write the temporary file for %s: %s", filename, strerror(errno));
+        failed = 1;
+    }
+
+    int rest = stream_data(s->sockfd, failed ? -1 : spool, file_size - buffered, 1);
+    if (rest < 0) {
+        /* Socket error or EOF: the loop ends and the target is untouched. */
+        if (spool != -1) {
+            close(spool);
+        }
+        return -1;
+    }
+    if (rest > 0) {
+        failed = 1;
+    }
+
+    if (!failed) {
+        failed = commit_save(spool, filename, file_size);
+    }
+    if (spool != -1) {
+        close(spool);
+    }
+    if (failed) {
+        s->save_errors++;
+    }
+    return (ssize_t)buffered;
+}
+
+/* Consume a payload that will not be saved, so the stream stays in sync. */
+static ssize_t
+discard_data(struct session* s, size_t buf_remaining_len, size_t file_size)
+{
+    size_t buffered = (buf_remaining_len < file_size) ? buf_remaining_len : file_size;
+
+    if (stream_data(s->sockfd, -1, file_size - buffered, 1) < 0) {
+        return -1;
+    }
+    return (ssize_t)buffered;
+}
+
+/* Only a file this run opened may be written: the editor is not trusted with paths. */
+static int
+known_token(const struct session* s, const char* token)
+{
+    for (int i = 0; i < s->n_tokens; i++) {
+        if (!strcmp(s->tokens[i], token)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* "data: N" must be a plain decimal that fits in size_t. */
+static int
+parse_data_len(const char* value, size_t* out)
+{
+    char* endp;
+
+    if (*value < '0' || *value > '9') {
+        return -1;
+    }
+    errno = 0;
+    unsigned long long n = strtoull(value, &endp, 10);
+    if (errno || *endp != '\0') {
+        return -1;
+    }
+#if SIZE_MAX < ULLONG_MAX
+    if (n > SIZE_MAX) {
+        return -1;
+    }
+#endif
+    *out = (size_t)n;
+    return 0;
+}
+
+static ssize_t
 read_line(char* buf, size_t len)
 {
     char* cmd_str = memchr(buf, '\n', len);
@@ -430,31 +626,38 @@ read_line(char* buf, size_t len)
     return line_len + 1;
 }
 
-ssize_t
-handle_line(int sockfd, char* buf, size_t len, struct cmd* cmd_state, int* save_errors)
+static ssize_t
+handle_line(struct session* s, char* buf, size_t len)
 {
+    struct cmd* cmd = &s->cmd;
     ssize_t read_len = 0;
     char *name, *value, *sep;
+    char shown[PROTO_BUF_SIZE];
 
-    switch (cmd_state->state) {
+    switch (cmd->state) {
         case CMD_CMD:
             if ((read_len = read_line(buf, len)) > 0 && *buf != '\0') {
-                free(cmd_state->filename);
-                memset(cmd_state, 0, sizeof(*cmd_state));
+                free(cmd->filename);
+                memset(cmd, 0, sizeof(*cmd));
 
-                if (!strcmp(buf, "close")) {
-                    log_msg(INFO, "Received close command");
-                } else if (!strcmp(buf, "save")) {
+                if (!strcmp(buf, "save")) {
+                    cmd->type = CMD_SAVE;
                     log_msg(INFO, "Received save command");
+                } else if (!strcmp(buf, "close")) {
+                    cmd->type = CMD_CLOSE;
+                    log_msg(INFO, "Received close command");
+                } else {
+                    log_msg(WARNING, "Ignoring unknown command %s", printable(buf, shown, sizeof(shown)));
                 }
 
-                cmd_state->state = CMD_VAR;
+                cmd->state = CMD_VAR;
             }
             break;
 
         case CMD_VAR:
             if ((read_len = read_line(buf, len)) == 0) {
-                goto reset_cmd;
+                /* Incomplete line: keep the state and wait for the rest. */
+                break;
             }
 
             if (*buf == '\0') {
@@ -474,35 +677,45 @@ handle_line(int sockfd, char* buf, size_t len, struct cmd* cmd_state, int* save_
             }
 
             if (!strcmp(name, "token")) {
-                free(cmd_state->filename);
-                cmd_state->filename = strdup(value);
-                if (!cmd_state->filename) {
+                free(cmd->filename);
+                cmd->filename = strdup(value);
+                if (!cmd->filename) {
                     log_msg(ERROR, "Failed to allocate memory for token: %s", strerror(errno));
                     return -1;
                 }
             } else if (!strcmp(name, "data")) {
-                char* endp;
-                errno = 0;
-                cmd_state->file_len = strtoul(value, &endp, 10);
-                if (errno || endp == value) {
-                    log_msg(WARNING, "Invalid data length: %s, ignoring", value);
-                    goto reset_cmd;
+                if (parse_data_len(value, &cmd->file_len) == -1) {
+                    /* Without a length the payload cannot be skipped, so the stream is lost. */
+                    log_msg(ERROR, "Invalid data length from the editor: %s", printable(value, shown, sizeof(shown)));
+                    return -1;
                 }
-                if (!cmd_state->filename) {
-                    log_msg(WARNING, "Received data without token, ignoring");
+
+                ssize_t consumed;
+                if (cmd->type != CMD_SAVE) {
+                    log_msg(WARNING, "Ignoring %zu bytes of data outside a save command", cmd->file_len);
+                    consumed = discard_data(s, len - read_len, cmd->file_len);
+                } else if (!cmd->filename) {
+                    log_msg(ERROR, "Received a save without a token, ignoring it");
+                    s->save_errors++;
+                    consumed = discard_data(s, len - read_len, cmd->file_len);
+                } else if (!known_token(s, cmd->filename)) {
+                    log_msg(ERROR,
+                            "Refusing to save %s, which this rmate did not open",
+                            printable(cmd->filename, shown, sizeof(shown)));
+                    s->save_errors++;
+                    consumed = discard_data(s, len - read_len, cmd->file_len);
                 } else {
-                    ssize_t data_consumed = receive_save(
-                      sockfd, buf + read_len, len - read_len, cmd_state->filename, cmd_state->file_len, save_errors);
-                    if (data_consumed < 0) {
-                        return -1;
-                    }
-                    read_len += data_consumed;
+                    consumed = receive_save(s, buf + read_len, len - read_len, cmd->filename, cmd->file_len);
                 }
+                if (consumed < 0) {
+                    return -1;
+                }
+                read_len += consumed;
             }
             break;
 
         reset_cmd:
-            cmd_state->state = CMD_CMD;
+            cmd->state = CMD_CMD;
             break;
 
         default:
@@ -512,13 +725,13 @@ handle_line(int sockfd, char* buf, size_t len, struct cmd* cmd_state, int* save_
     return read_len;
 }
 
-ssize_t
-handle_cmds(int sockfd, char* buf, size_t len, struct cmd* cmd_state, int* save_errors)
+static ssize_t
+handle_cmds(struct session* s, char* buf, size_t len)
 {
     size_t total_read_len = 0;
 
     while (total_read_len < len) {
-        ssize_t read_len = handle_line(sockfd, buf, len - total_read_len, cmd_state, save_errors);
+        ssize_t read_len = handle_line(s, buf, len - total_read_len);
 
         if (read_len < 0) {
             return -1;
@@ -534,7 +747,7 @@ handle_cmds(int sockfd, char* buf, size_t len, struct cmd* cmd_state, int* save_
     return total_read_len;
 }
 
-char*
+static char*
 parse_ssh_host(void)
 {
     const char* ssh = getenv("SSH_CONNECTION");
@@ -554,18 +767,28 @@ parse_ssh_host(void)
     return result;
 }
 
-int
+static int
 in_ssh_session(void)
 {
     const char* ssh = getenv("SSH_CONNECTION");
     return ssh && *ssh;
 }
 
+/* Milliseconds on a monotonic clock, for timeouts that must not restart on EINTR or per byte. */
+static long long
+now_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 /*
  * connect() with a timeout, so a host that drops packets fails instead of
  * blocking for the kernel's SYN retry period. Returns 0, or -1 with errno set.
  */
-int
+static int
 connect_timeout(int fd, const struct sockaddr* addr, socklen_t addrlen, int timeout_ms)
 {
     int flags = fcntl(fd, F_GETFL);
@@ -578,10 +801,12 @@ connect_timeout(int fd, const struct sockaddr* addr, socklen_t addrlen, int time
             return -1;
         }
 
+        long long deadline = now_ms() + timeout_ms;
         struct pollfd pfd = { .fd = fd, .events = POLLOUT };
         int pr;
         do {
-            pr = poll(&pfd, 1, timeout_ms);
+            long long remaining = deadline - now_ms();
+            pr = poll(&pfd, 1, remaining > 0 ? (int)remaining : 0);
         } while (pr == -1 && errno == EINTR);
         if (pr == -1) {
             return -1;
@@ -605,7 +830,7 @@ connect_timeout(int fd, const struct sockaddr* addr, socklen_t addrlen, int time
     return fcntl(fd, F_SETFL, flags);
 }
 
-int
+static int
 connect_mate(const char* host, const char* port)
 {
     int sockfd = -1;
@@ -672,16 +897,23 @@ connect_mate(const char* host, const char* port)
  * sshd then closes the socket, so the greeting is the first sign of a live
  * editor. Read it byte by byte so nothing after it is consumed.
  */
-int
+static int
 read_greeting(int sockfd, const char* host, const char* port)
 {
     char buf[GREETING_MAX];
+    char shown[GREETING_MAX];
     size_t len = 0;
     const char* problem = NULL;
+    long long deadline = now_ms() + GREETING_TIMEOUT_MS;
 
     while (!problem) {
+        long long remaining = deadline - now_ms();
+        if (remaining <= 0) {
+            problem = "timed out waiting for its greeting";
+            break;
+        }
         struct pollfd pfd = { .fd = sockfd, .events = POLLIN };
-        int pr = poll(&pfd, 1, GREETING_TIMEOUT_MS);
+        int pr = poll(&pfd, 1, (int)remaining);
         if (pr == -1) {
             if (errno == EINTR) {
                 continue;
@@ -714,7 +946,7 @@ read_greeting(int sockfd, const char* host, const char* port)
             if (len > 0 && buf[len - 1] == '\r') {
                 buf[len - 1] = '\0';
             }
-            log_msg(INFO, "Server header: %s", buf);
+            log_msg(INFO, "Server header: %s", printable(buf, shown, sizeof(shown)));
             return 0;
         }
         if (++len == sizeof(buf)) {
@@ -731,7 +963,7 @@ read_greeting(int sockfd, const char* host, const char* port)
     return -1;
 }
 
-const char*
+static const char*
 make_display_name(const char* display_name, const char* hostname, const char* filename, char* buf, size_t buf_len)
 {
     if (display_name) {
@@ -741,7 +973,7 @@ make_display_name(const char* display_name, const char* hostname, const char* fi
     return buf;
 }
 
-void
+static void
 version(void)
 {
 #ifdef BUILD_ID
@@ -757,7 +989,7 @@ version(void)
             __DATE__);
 }
 
-void
+static void
 usage(void)
 {
     fprintf(stderr,
@@ -810,8 +1042,12 @@ struct options
     int* file_cols;
 };
 
-/* Parse "LINE" or "LINE:COL", both positive. Returns 0 on success, -1 otherwise. */
-int
+/*
+ * Parse "LINE" or "LINE:COL". LINE must be positive. COL 0 means no column,
+ * since subl and RemoteSubl use "file:LINE:0" for a line on its own.
+ * Returns 0 on success, -1 otherwise.
+ */
+static int
 parse_position(const char* s, int* line, int* col)
 {
     char* endp;
@@ -832,7 +1068,7 @@ parse_position(const char* s, int* line, int* col)
         }
         errno = 0;
         c = strtol(cs, &endp, 10);
-        if (errno || c <= 0 || c > INT_MAX) {
+        if (errno || c > INT_MAX) {
             return -1;
         }
     }
@@ -851,7 +1087,7 @@ parse_position(const char* s, int* line, int* col)
  * ":LINE" does, split the position off. Returns 1 with a malloc'd *path on a
  * split, 0 to use arg as is, -1 on allocation failure.
  */
-int
+static int
 split_file_position(const char* arg, char** path, int* line, int* col)
 {
     struct stat st;
@@ -898,10 +1134,10 @@ split_file_position(const char* arg, char** path, int* line, int* col)
 /*
  * Returns:
  *   0  success, opts populated, *out_argc / *out_argv set to remaining args
- *   1  error (message already logged)
+ *   1  error (message or usage already printed, caller should exit 1)
  *  -1  early exit (version/help already printed, caller should exit 0)
  */
-int
+static int
 parse_options(int orig_argc, char* orig_argv[], int* out_argc, char*** out_argv, struct options* opts)
 {
     opts->host = getenv(HOST_ENV);
@@ -956,6 +1192,9 @@ parse_options(int orig_argc, char* orig_argv[], int* out_argc, char*** out_argv,
                 opts->send_column = 1;
                 break;
             case 'm':
+                if (!header_value_ok("Display name", optarg)) {
+                    return 1;
+                }
                 opts->names[opts->n_names++] = optarg;
                 break;
             case 'f':
@@ -968,9 +1207,11 @@ parse_options(int orig_argc, char* orig_argv[], int* out_argc, char*** out_argv,
                 version();
                 return -1;
             case 'h':
-            default:
                 usage();
                 return -1;
+            default:
+                usage();
+                return 1;
         }
     }
 
@@ -988,6 +1229,12 @@ parse_options(int orig_argc, char* orig_argv[], int* out_argc, char*** out_argv,
             pending_line = line;
             pending_col = col;
             continue;
+        }
+
+        /* BSD getopt stops at the first file name, so "rmate f -w" would otherwise create a file named -w. */
+        if (arg[0] == '-' && arg[1] != '\0' && stat(arg, &st) == -1 && errno == ENOENT) {
+            log_msg(ERROR, "%s is not a file, and options must come before file names", arg);
+            return 1;
         }
 
         opts->files[n_files] = orig_argv[i];
@@ -1017,7 +1264,7 @@ parse_options(int orig_argc, char* orig_argv[], int* out_argc, char*** out_argv,
 
     if (*out_argc < 1) {
         usage();
-        return -1;
+        return 1;
     }
 
     if (!strcmp(opts->host, "auto")) {
@@ -1034,7 +1281,7 @@ parse_options(int orig_argc, char* orig_argv[], int* out_argc, char*** out_argv,
     return 0;
 }
 
-void
+static void
 free_options(struct options* opts)
 {
     if (opts->owned_files) {
@@ -1052,7 +1299,7 @@ free_options(struct options* opts)
     free(opts->auto_host);
 }
 
-int
+static int
 send_files(int sockfd,
            int argc,
            char** argv,
@@ -1093,13 +1340,12 @@ send_files(int sockfd,
     return 0;
 }
 
-int
-receive_loop(int sockfd, int* save_errors)
+/* The greeting was already consumed by read_greeting, so s->cmd starts in CMD_CMD. */
+static int
+receive_loop(struct session* s)
 {
     char buf[PROTO_BUF_SIZE];
     size_t buf_used = 0;
-    /* The greeting was already consumed by read_greeting. */
-    struct cmd cmd_state = { .state = CMD_CMD };
     int ret = 0;
 
     while (1) {
@@ -1109,7 +1355,7 @@ receive_loop(int sockfd, int* save_errors)
             break;
         }
 
-        ssize_t num_bytes = read(sockfd, buf + buf_used, sizeof(buf) - 1 - buf_used);
+        ssize_t num_bytes = read(s->sockfd, buf + buf_used, sizeof(buf) - 1 - buf_used);
         if (num_bytes == -1) {
             if (errno == EINTR) {
                 continue;
@@ -1119,13 +1365,17 @@ receive_loop(int sockfd, int* save_errors)
             break;
         }
         if (num_bytes == 0) {
+            if (buf_used > 0) {
+                log_msg(ERROR, "Editor closed the connection in the middle of a command");
+                ret = 1;
+            }
             break;
         }
 
         buf_used += num_bytes;
         buf[buf_used] = '\0';
 
-        ssize_t consumed = handle_cmds(sockfd, buf, buf_used, &cmd_state, save_errors);
+        ssize_t consumed = handle_cmds(s, buf, buf_used);
         if (consumed < 0) {
             ret = 1;
             break;
@@ -1140,16 +1390,17 @@ receive_loop(int sockfd, int* save_errors)
         }
     }
 
-    if (*save_errors > 0) {
-        log_msg(WARNING, "%d save(s) failed", *save_errors);
+    if (s->save_errors > 0) {
+        log_msg(WARNING, "%d save(s) failed", s->save_errors);
         ret = 1;
     }
 
-    free(cmd_state.filename);
+    free(s->cmd.filename);
+    s->cmd.filename = NULL;
     return ret;
 }
 
-void
+static void
 close_connection(int sockfd)
 {
     /* Send FIN so the server gets a clean EOF immediately. */
@@ -1176,7 +1427,7 @@ main(int argc, char* argv[])
     char hostname[HOST_NAME_MAX + 1];
     char* stdin_data = NULL;
     size_t stdin_len = 0;
-    int save_errors = 0;
+    struct session sess = { .sockfd = -1, .cmd = { .state = CMD_CMD } };
 
     signal(SIGCHLD, SIG_IGN);
     signal(SIGPIPE, SIG_IGN);
@@ -1256,11 +1507,14 @@ main(int argc, char* argv[])
         /*
          * Release the caller's stdin, and stdout unless a "-" edit is written
          * there, so out=$(rmate f) or a pipe doesn't wait for the file to close.
-         * stderr stays so a failed save is still reported.
+         * stderr stays so a failed save is still reported, unless it is a pipe
+         * or socket: a reader on the other end (sshd without a pty, 2>&1 into
+         * $(...)) would wait for this process to exit.
          */
         int devnull = open("/dev/null", O_RDWR | O_CLOEXEC);
         if (devnull != -1) {
             int uses_stdout = 0;
+            struct stat st;
             for (int i = 0; i < argc; i++) {
                 if (!strcmp(argv[i], "-")) {
                     uses_stdout = 1;
@@ -1270,11 +1524,17 @@ main(int argc, char* argv[])
             if (!uses_stdout) {
                 dup2(devnull, STDOUT_FILENO);
             }
+            if (fstat(STDERR_FILENO, &st) == 0 && (S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode))) {
+                dup2(devnull, STDERR_FILENO);
+            }
             close(devnull);
         }
     }
 
-    ret = receive_loop(sockfd, &save_errors);
+    sess.sockfd = sockfd;
+    sess.tokens = argv;
+    sess.n_tokens = argc;
+    ret = receive_loop(&sess);
 
 cleanup:
     if (sockfd != -1) {

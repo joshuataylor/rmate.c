@@ -62,8 +62,12 @@ CMD_CMD --(command name)--> CMD_VAR
    +--(empty line / error)------+
 ```
 
-- **CMD_CMD**: Waits for a command name (`save` or `close`), transitions to CMD_VAR.
-- **CMD_VAR**: Parses `key: value` pairs. An empty line or parse error transitions back to CMD_CMD.
+- **CMD_CMD**: Waits for a command name (`save`, `close`, or anything else,
+  which is ignored with a warning) and transitions to CMD_VAR.
+- **CMD_VAR**: Parses `key: value` pairs. An empty line, or a line without a
+  colon, transitions back to CMD_CMD. An incomplete line keeps the state until
+  the next `read()` completes it: TCP, and the client's own read size, can cut
+  a header anywhere.
 
 ### Save Command
 
@@ -77,9 +81,14 @@ data: 5678\n
 \n
 ```
 
-The client matches the `token` to the original filename, reads `data` bytes
-(partly from the buffer, the rest directly from the socket), and writes them
-to disk. After the data, an empty line ends the command.
+The client accepts the save only on a `save` command whose `token` names a
+file this invocation opened (or `-` when stdin was sent). `data` must be a
+plain decimal; anything else ends the connection, since a payload of unknown
+length cannot be skipped. The payload is read (partly from the buffer, the
+rest directly from the socket) into a temporary file and copied over the
+target once all of it has arrived, so a dropped connection leaves the original
+intact. Data on any other command, or for an unknown token, is read and
+discarded. After the data, an empty line ends the command.
 
 ### Close Command
 
@@ -96,7 +105,8 @@ No file data is included. The empty line ends the command.
 ### Connection Teardown
 
 When the server closes the TCP connection (all tabs closed), the client's
-`read()` returns 0 and the main loop exits.
+`read()` returns 0 and the main loop exits. EOF in the middle of a command is
+reported and the exit status is 1.
 
 ## Buffer Management
 
