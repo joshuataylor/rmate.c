@@ -18,6 +18,7 @@
 #define HOST_ENV "RMATE_HOST"
 #define PORT_ENV "RMATE_PORT"
 #define COLUMN_ENV "RMATE_COLUMN"
+#define QUIET_ENV "RMATE_QUIET"
 #define DEFAULT_HOST "localhost"
 #define DEFAULT_PORT "52698"
 
@@ -39,6 +40,8 @@
 #endif
 
 static int verbose = 0;
+/* -q: no messages at all, for callers whose screen they would corrupt (a TUI's $EDITOR). */
+static int quiet = 0;
 /* Set in the forked child, which logs after the shell has redrawn its prompt. */
 static int background = 0;
 
@@ -94,7 +97,7 @@ PRINTF_LIKE(2, 3)
 static void
 log_msg(enum log_type type, const char* fmt, ...)
 {
-    if (type == INFO && !verbose) {
+    if (quiet || (type == INFO && !verbose)) {
         return;
     }
 
@@ -1010,16 +1013,22 @@ usage(void)
             "           preceding +LINE) wins over -l for that file.\n"
             "  -c       Send column numbers (selection: LINE:COL). Only for editor\n"
             "           servers that accept a column; also enabled by $%s=1.\n"
+            "  -q       Print no messages (errors still set the exit status);\n"
+            "           also enabled by $%s=1. Wins over -v.\n"
             "  -m NAME  The display name shown in TextMate.\n"
             "  -f       Open even if file is not writable.\n"
             "  -v       Verbose logging messages.\n"
             "  -V       Print version information.\n"
-            "  -h       Print this help.\n",
+            "  -h       Print this help.\n"
+            "\n"
+            "Exit status: 0 on success, 2 when no editor answered (nothing was\n"
+            "sent, so a wrapper can fall back to another editor), 1 otherwise.\n",
             HOST_ENV,
             DEFAULT_HOST,
             PORT_ENV,
             DEFAULT_PORT,
-            COLUMN_ENV);
+            COLUMN_ENV,
+            QUIET_ENV);
 }
 
 struct options
@@ -1151,6 +1160,8 @@ parse_options(int orig_argc, char* orig_argv[], int* out_argc, char*** out_argv,
 
     const char* column_env = getenv(COLUMN_ENV);
     opts->send_column = column_env && *column_env && strcmp(column_env, "0") != 0;
+    const char* quiet_env = getenv(QUIET_ENV);
+    quiet = quiet_env && *quiet_env && strcmp(quiet_env, "0") != 0;
 
     opts->lines = calloc(orig_argc, sizeof(*opts->lines));
     opts->cols = calloc(orig_argc, sizeof(*opts->cols));
@@ -1166,7 +1177,7 @@ parse_options(int orig_argc, char* orig_argv[], int* out_argc, char*** out_argv,
     }
 
     int ch;
-    while ((ch = getopt(orig_argc, orig_argv, "whvfcVH:p:l:m:")) != -1) {
+    while ((ch = getopt(orig_argc, orig_argv, "whvfcqVH:p:l:m:")) != -1) {
         switch (ch) {
             case 'w':
                 opts->need_wait = 1;
@@ -1190,6 +1201,9 @@ parse_options(int orig_argc, char* orig_argv[], int* out_argc, char*** out_argv,
             }
             case 'c':
                 opts->send_column = 1;
+                break;
+            case 'q':
+                quiet = 1;
                 break;
             case 'm':
                 if (!header_value_ok("Display name", optarg)) {
@@ -1465,13 +1479,14 @@ main(int argc, char* argv[])
         }
     }
 
+    /* Exit 2 when no editor could be reached, so a wrapper can fall back to another editor. */
     if ((sockfd = connect_mate(opts.host, opts.port)) == -1) {
-        ret = 1;
+        ret = 2;
         goto cleanup;
     }
 
     if (read_greeting(sockfd, opts.host, opts.port) == -1) {
-        ret = 1;
+        ret = 2;
         goto cleanup;
     }
 

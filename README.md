@@ -63,11 +63,16 @@ Options:
            preceding +LINE) wins over -l for that file.
   -c       Send column numbers (selection: LINE:COL). Only for editor
            servers that accept a column; also enabled by $RMATE_COLUMN=1.
+  -q       Print no messages (errors still set the exit status);
+           also enabled by $RMATE_QUIET=1. Wins over -v.
   -m NAME  The display name shown in TextMate.
   -f       Open even if file is not writable.
   -v       Verbose logging messages.
   -V       Print version information.
   -h       Print this help.
+
+Exit status: 0 on success, 2 when no editor answered (nothing was
+sent, so a wrapper can fall back to another editor), 1 otherwise.
 ```
 
 ## Environment Variables
@@ -77,6 +82,7 @@ Options:
 | `RMATE_HOST` | Editor host to connect to            | `localhost` |
 | `RMATE_PORT` | Editor port to connect to            | `52698`     |
 | `RMATE_COLUMN` | `1` sends `selection: LINE:COL` (same as `-c`) | unset |
+| `RMATE_QUIET` | `1` prints no messages (same as `-q`), for a TUI's `$EDITOR` | unset |
 
 Setting `RMATE_HOST=auto` detects the client IP from `SSH_CONNECTION`.
 
